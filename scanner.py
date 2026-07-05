@@ -3,16 +3,12 @@
 StockExplorer 1단계 저평가 탐색 스캐너 (프리컴퓨트)
 - 네이버 시가총액 목록에서 KOSPI/KOSDAQ 전 종목의 코드/현재가/주식수를 수집
 - 종목마다 FnGuide/네이버 재무를 스크래핑해 적정주가·목표주가·EPS·BPS·부채비율 등을 계산
-  (윈도우 메인 프로그램 app_window_v1.0.0.py 의 analyze_stock 로직과 동일)
 - 결과를 Supabase Edge Function(admin_save_stage1_results)에 업로드
+- 1단계 결과로 2-1 시장 공통 다이제스트도 만들어 업로드(admin_save_stage2_digest)
 
 환경변수:
-  SUPABASE_FUNCTIONS_URL  기본값 있음 (없으면 하드코딩된 기본 URL 사용)
-  SUPABASE_ANON_KEY       기본값 있음
-  ADMIN_TOKEN             (필수) 결과 업로드 인증용
-  SCAN_LIMIT              (선택) 시장별 상위 N개만 스캔 (테스트용). 미설정 시 전체.
-사용:
-  ADMIN_TOKEN=... python scanner.py
+  ADMIN_TOKEN  (필수) 결과 업로드 인증용
+  SCAN_LIMIT   (선택) 시장별 상위 N개만 스캔 (테스트용). 미설정 시 전체.
 """
 import os
 import io
@@ -328,13 +324,55 @@ def analyze_stock(ticker, name, market, current_price, shares, marcap_rank):
     }
 
 
-def upload(results):
+def upload(results, universe_counts):
     payload = {"action": "admin_save_stage1_results", "admin_token": ADMIN_TOKEN,
-               "results": results, "scan_at": datetime.datetime.utcnow().isoformat() + "Z"}
+               "results": results, "universe": universe_counts,
+               "scan_at": datetime.datetime.utcnow().isoformat() + "Z"}
     resp = requests.post(SUPABASE_FUNCTIONS_URL, json=payload,
                          headers={"Authorization": f"Bearer {SUPABASE_ANON_KEY}",
                                   "Content-Type": "application/json"}, timeout=60)
     print("upload:", resp.status_code, resp.text[:300])
+    resp.raise_for_status()
+
+
+def build_stage2_digest(results):
+    """2-1 시장 공통 분석: stage1 결과(이미 계산됨)로 시장 밸류에이션 요약을 만든다."""
+    from collections import Counter
+    total = len(results)
+    under = [d for d in results if (d.get("gap10") or 0) > 0]
+
+    def mkt_stat(m):
+        rows = [d for d in results if d.get("market") == m]
+        u = [d for d in rows if (d.get("gap10") or 0) > 0]
+        avg = round(sum(d.get("gap10") or 0 for d in rows) / len(rows), 2) if rows else 0
+        return {"market": m, "total": len(rows), "under": len(u), "avg_gap": avg}
+
+    top = sorted(under, key=lambda d: d.get("gap10") or 0, reverse=True)[:10]
+    top_list = [{"code": d["code"], "name": d["name"], "market": d["market"],
+                 "gap10": d["gap10"], "current_price": d["current_price"], "fair10": d["fair10"]}
+                for d in top]
+    sec = Counter(d.get("sector") for d in under
+                  if d.get("sector") and d.get("sector") != "-")
+    top_sectors = [{"sector": s, "count": c} for s, c in sec.most_common(5)]
+    avg_gap_all = round(sum(d.get("gap10") or 0 for d in results) / total, 2) if total else 0
+    return {
+        "total": total,
+        "under_count": len(under),
+        "under_ratio": round(len(under) / total * 100, 1) if total else 0,
+        "avg_gap": avg_gap_all,
+        "markets": [mkt_stat("KOSPI"), mkt_stat("KOSDAQ")],
+        "top": top_list,
+        "top_sectors": top_sectors,
+    }
+
+
+def upload_digest(digest):
+    payload = {"action": "admin_save_stage2_digest", "admin_token": ADMIN_TOKEN,
+               "digest": digest, "scan_at": datetime.datetime.utcnow().isoformat() + "Z"}
+    resp = requests.post(SUPABASE_FUNCTIONS_URL, json=payload,
+                         headers={"Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                                  "Content-Type": "application/json"}, timeout=30)
+    print("upload_digest:", resp.status_code, resp.text[:200])
     resp.raise_for_status()
 
 
@@ -344,11 +382,13 @@ def main():
 
     t0 = time.time()
     universe = []
+    universe_counts = {}
     for sosok, mkt in [(0, "KOSPI"), (1, "KOSDAQ")]:
         rows = collect_market(sosok)
         for rank, r in enumerate(rows, start=1):
             r["Market"] = mkt; r["Rank"] = rank
         universe.extend(rows)
+        universe_counts[mkt] = len(rows)  # 실제 탐색(수집)한 전체 종목 수
         print(f"{mkt}: {len(rows)} 종목 수집")
 
     print(f"총 {len(universe)} 종목 분석 시작...")
@@ -368,10 +408,13 @@ def main():
             except Exception:
                 pass
 
-    # 시장+시총순위로 정렬
     results.sort(key=lambda d: (d["market"], d["marcap_rank"]))
     print(f"분석 완료: 유효 {len(results)}종목 / 소요 {time.time()-t0:.0f}s")
-    upload(results)
+    upload(results, universe_counts)
+    try:
+        upload_digest(build_stage2_digest(results))
+    except Exception as e:
+        print("2-1 다이제스트 업로드 실패:", e)
     print("완료.")
 
 
