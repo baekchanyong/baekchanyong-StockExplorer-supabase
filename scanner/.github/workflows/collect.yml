@@ -1,0 +1,24 @@
+name: stage2-collect
+
+# 매일 08:00 KST 시장 관심도 '데이터 수집'(LLM 없음). 요약은 모바일에서 사용자별 AI가 수행.
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 08:00 KST (UTC+9)
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r scanner/requirements.txt
+      - name: Run collector
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: python scanner/market_collect.py
